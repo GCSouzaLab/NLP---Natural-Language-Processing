@@ -1,0 +1,12 @@
+# IDE IntelliJ
+.idea/
+
+# Arquivos de build (exemplo comum)
+target/
+build/
+
+# Logs
+*.log
+
+# Arquivos de sistema
+.DS_Store
