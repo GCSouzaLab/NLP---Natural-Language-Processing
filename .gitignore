@@ -10,3 +10,6 @@ build/
 
 # Arquivos de sistema
 .DS_Store
+
+# Arquivos de cache python
+*.pyc
