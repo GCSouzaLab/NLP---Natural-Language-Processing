@@ -21,6 +21,9 @@ Stemming.ipynp
 Results:
 
 todas_as_praias
+
 todas_as_praias_tokenizado
+
 todas_as_praias_remove_stopwords
+
 todas_as_praias_lemmatized  (Made both strategies, stemming and lemmatizing)
