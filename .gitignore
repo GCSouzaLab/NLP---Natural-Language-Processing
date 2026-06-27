@@ -13,3 +13,5 @@ build/
 
 # Arquivos de cache python
 *.pyc
+
+.streamlit/secrets.toml
