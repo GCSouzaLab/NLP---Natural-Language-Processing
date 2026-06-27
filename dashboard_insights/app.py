@@ -17,13 +17,11 @@ import streamlit as st
 from wordcloud import WordCloud
 
 import data as dados
+from chatbot_tab import render_chatbot
 
 st.set_page_config(page_title="Insights — Praias de SC", page_icon="🏖️", layout="wide")
 
 
-# --------------------------------------------------------------------------- #
-# Carga (com cache)                                                           #
-# --------------------------------------------------------------------------- #
 @st.cache_data(show_spinner="Carregando e processando as avaliações...")
 def _carregar(fonte):
     return dados.carregar_dados(fonte)
@@ -54,10 +52,6 @@ def obter_dados():
 
 df = obter_dados()
 
-
-# --------------------------------------------------------------------------- #
-# Filtros (barra lateral)                                                     #
-# --------------------------------------------------------------------------- #
 st.sidebar.header("Filtros")
 
 anos = df["ano"].dropna()
@@ -72,6 +66,31 @@ else:
 
 notas = st.sidebar.multiselect("Notas (rating)", [1, 2, 3, 4, 5], default=[1, 2, 3, 4, 5])
 
+with st.sidebar:
+    st.divider()
+    st.markdown("### 🏖️ Assistente de Praias")
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] .chat-container {
+            height: 420px;
+            overflow-y: auto;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 8px;
+            background: #fafafa;
+        }
+        /* Impede que o chat_input empurre o layout da sidebar */
+        [data-testid="stSidebar"] [data-testid="stChatInput"] {
+            position: sticky;
+            bottom: 0;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    render_chatbot()
+
 dff = df[
     df["ano"].between(faixa[0], faixa[1])
     & df["praia"].isin(sel_praias)
@@ -79,9 +98,6 @@ dff = df[
 ].copy()
 
 
-# --------------------------------------------------------------------------- #
-# Cabeçalho + métricas                                                        #
-# --------------------------------------------------------------------------- #
 st.title("🏖️ Dashboard de Insights — Praias de Santa Catarina")
 st.caption("Módulo 3 · avaliações do TripAdvisor · proxy de aspectos até o ABSA")
 
@@ -99,9 +115,6 @@ c3.metric("Nota média", f"{dff['rating'].mean():.2f}")
 c4.metric("Turistas de fora de SC", "—" if origem.empty else f"{fora_sc:.0f}%")
 
 
-# --------------------------------------------------------------------------- #
-# Abas                                                                        #
-# --------------------------------------------------------------------------- #
 aba_origem, aba_tempo, aba_aspectos, aba_nuvem = st.tabs(
     ["🗺️ Origem", "📈 Evolução temporal", "⭐ Aspectos", "☁️ Nuvem de palavras"]
 )
