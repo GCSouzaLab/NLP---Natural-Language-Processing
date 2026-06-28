@@ -5,7 +5,7 @@ Carrega o CSV final da pipeline (`avaliacoes_praias_final.csv`), reconstrói as
 colunas de tokens e deriva os campos usados pelo dashboard:
   - UF e cidade de origem (a partir de `location`)
   - data (`dt`, `ano`, `mes`) com parser para os formatos mistos
-  - flags de aspecto (proxy por palavras-chave) até o ABSA do Daniel ficar pronto
+  - aspectos via ABSA (Gemini), agregados a partir do arquivo granular review × aspecto
 
 Os parsers aqui são os mesmos validados na etapa de exploração.
 """
@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import ast
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 ARQUIVO_PADRAO = "avaliacoes_praias_final.csv"
+ARQUIVO_ABSA = "avaliacoes_aspectos_gemini.csv"  # saída do ABSA (Gemini), review × aspecto
 
 
 # --------------------------------------------------------------------------- #
@@ -60,7 +62,17 @@ ESTADO_NOME = {
     "roraima": "RR", "santa catarina": "SC", "são paulo": "SP", "sergipe": "SE",
     "tocantins": "TO",
 }
-NOME_POR_UF = {sigla: nome.title() for nome, sigla in ESTADO_NOME.items()}
+# Atenção: nome.title() colocaria os conectores em maiúscula ("Rio Grande Do Sul"),
+# o que NÃO casa com o GeoJSON do mapa (que usa "Rio Grande do Sul") — assim RS, RJ,
+# RN e MS sumiam do choropleth. Mantemos de/do/da/dos/das/e em minúsculo.
+_CONECTORES = {"de", "do", "da", "dos", "das", "e"}
+
+
+def _nome_proprio_estado(nome: str) -> str:
+    return " ".join(p if p in _CONECTORES else p.capitalize() for p in nome.split())
+
+
+NOME_POR_UF = {sigla: _nome_proprio_estado(nome) for nome, sigla in ESTADO_NOME.items()}
 
 
 def parse_uf(s):
@@ -112,67 +124,108 @@ def parse_data(s):
 
 
 # --------------------------------------------------------------------------- #
-# Aspectos (proxy por palavras-chave — substituir pelo ABSA quando pronto)     #
+# Aspectos (ABSA do Gemini — matriz praia × aspecto)                           #
+#                                                                              #
+# Antes era um proxy por palavras-chave (flags asp_*). Agora lemos a saída real #
+# do ABSA: o arquivo granular (uma linha por review × aspecto) é agregado sob   #
+# demanda no recorte filtrado (dff), preservando a reação aos filtros de        #
+# ano/nota/praia. A ligação com a base é a coluna `review_id` (ordem das        #
+# linhas). Para voltar ao proxy, recuperar a versão anterior no histórico git.  #
 # --------------------------------------------------------------------------- #
-ASPECTOS = {
-    "limpeza":   {"limpo", "limpeza", "sujo", "sujeira", "lixo", "poluir", "poluição", "poluído"},
-    "segurança": {"seguro", "segurança", "perigoso", "perigo", "assalto", "roubo", "violência", "tranquilo"},
-    "estrutura": {"estrutura", "infraestrutura", "banheiro", "quiosque", "restaurante", "bar", "estacionamento", "chuveiro"},
-    "mar/água":  {"mar", "água", "onda", "agitado", "calmo", "correnteza", "maré", "azul"},
-    "acesso":    {"acesso", "acessível", "escada", "trilha", "difícil", "fácil", "chegar", "estrada"},
-    "beleza":    {"bonito", "lindo", "belo", "paisagem", "vista", "natureza", "maravilhoso", "paradisíaco"},
-}
+_absa_cache: pd.DataFrame | None = None
+
+SENT_NEGATIVOS = {"negativo", "muito_negativo"}
 
 
-def _tokens_review(row):
-    """Conjunto de tokens (lematizados) em minúsculo, título + texto."""
-    return {w.lower() for w in set(row["text_lemmatized"]) | set(row["title_lemmatized"])}
+def _carregar_absa() -> pd.DataFrame:
+    """Lê o ABSA granular (review × aspecto) uma vez e mantém em cache."""
+    global _absa_cache
+    if _absa_cache is None:
+        caminho = Path(__file__).resolve().parent / ARQUIVO_ABSA
+        a = pd.read_csv(caminho)
+        a = a[a["aspecto"].notna()].drop_duplicates(["review_id", "aspecto"])
+        _absa_cache = a.reset_index(drop=True)
+    return _absa_cache
 
 
-def adicionar_flags_aspecto(df: pd.DataFrame) -> pd.DataFrame:
-    """Cria as colunas booleanas `asp_<aspecto>` indicando menção ao aspecto."""
-    tok = df.apply(_tokens_review, axis=1)
-    for asp, kws in ASPECTOS.items():
-        df["asp_" + asp] = tok.apply(lambda t, kws=kws: len(t & kws) > 0)
-    return df
+def _taxonomia() -> tuple[list[str], dict[str, str]]:
+    """Lista de aspectos (ordenada pelo nome legível) e mapa slug -> nome."""
+    a = _carregar_absa()
+    pares = (a[["aspecto", "aspecto_nome"]]
+             .drop_duplicates()
+             .sort_values("aspecto_nome"))
+    return list(pares["aspecto"]), dict(zip(pares["aspecto"], pares["aspecto_nome"]))
+
+
+def _absa_do_recorte(df: pd.DataFrame) -> pd.DataFrame:
+    """ABSA limitado às reviews de `df`, com praia/rating vindos da base.
+
+    Junta por `review_id`. Cada linha é uma menção a um aspecto numa review e
+    carrega o rating geral e a praia da própria base — assim a agregação
+    acompanha os filtros (ano/nota/praia) aplicados no dashboard.
+    """
+    absa = _carregar_absa()[
+        ["review_id", "aspecto", "aspecto_nome", "nota_aspecto", "sentimento", "confianca"]
+    ]
+    base = df[["review_id", "praia", "rating"]]
+    return absa.merge(base, on="review_id", how="inner")
 
 
 def resumo_aspectos(df: pd.DataFrame) -> pd.DataFrame:
-    """Tabela: menções, % avaliações, nota quando citado, lift e % de negativas."""
+    """Tabela global por aspecto: menções, % de avaliações, notas, lift e % negativas."""
+    aspectos, rotulo = _taxonomia()
+    sub = _absa_do_recorte(df)
+    total = len(df)
     media_global = df["rating"].mean()
     linhas = []
-    for asp in ASPECTOS:
-        col = "asp_" + asp
-        cit = df[df[col]]
+    for asp in aspectos:
+        m = sub[sub["aspecto"] == asp]
+        if m.empty:
+            continue
         linhas.append({
-            "aspecto": asp,
-            "menções": int(df[col].sum()),
-            "% avaliações": round(df[col].mean() * 100, 1),
-            "nota quando citado": round(cit["rating"].mean(), 2),
-            "lift (vs média)": round(cit["rating"].mean() - media_global, 2),
-            "% negativas (<=2)": round((cit["rating"] <= 2).mean() * 100, 1),
+            "aspecto": rotulo[asp],
+            "menções": int(len(m)),
+            "% avaliações": round(len(m) / total * 100, 1) if total else 0.0,
+            "nota do aspecto": round(m["nota_aspecto"].mean(), 2),
+            "nota quando citado": round(m["rating"].mean(), 2),
+            "lift (vs média)": round(m["rating"].mean() - media_global, 2),
+            "% negativas": round(m["sentimento"].isin(SENT_NEGATIVOS).mean() * 100, 1),
+            "confiança": round(m["confianca"].mean(), 2),
         })
-    return pd.DataFrame(linhas).sort_values("lift (vs média)")
+    cols = ["aspecto", "menções", "% avaliações", "nota do aspecto",
+            "nota quando citado", "lift (vs média)", "% negativas", "confiança"]
+    out = pd.DataFrame(linhas, columns=cols)
+    return out.sort_values("lift (vs média)") if not out.empty else out
 
 
 def matriz_frequencia(df: pd.DataFrame) -> pd.DataFrame:
-    """% de avaliações de cada praia que citam cada aspecto."""
-    freq = df.groupby("praia")[["asp_" + a for a in ASPECTOS]].mean() * 100
-    freq.columns = list(ASPECTOS.keys())
+    """% de avaliações de cada praia que citam cada aspecto (reage aos filtros)."""
+    aspectos, rotulo = _taxonomia()
+    sub = _absa_do_recorte(df)
+    tot = df.groupby("praia").size()
+    cont = sub.groupby(["praia", "aspecto"]).size().unstack(fill_value=0)
+    cont = cont.reindex(index=tot.index, columns=aspectos).fillna(0)
+    freq = cont.div(tot, axis=0) * 100
+    freq.columns = [rotulo[a] for a in aspectos]
     return freq
 
 
 def matriz_lift(df: pd.DataFrame, min_mencoes: int = 10) -> pd.DataFrame:
-    """Nota de quem cita o aspecto MENOS a média da praia (vermelho = ponto fraco)."""
+    """Nota média de quem cita o aspecto MENOS a média da praia (vermelho = ponto fraco)."""
+    aspectos, rotulo = _taxonomia()
+    sub = _absa_do_recorte(df)
     linhas = {}
     for praia, g in df.groupby("praia"):
         base = g["rating"].mean()
+        sp = sub[sub["praia"] == praia]
         linhas[praia] = {
-            asp: (g.loc[g["asp_" + asp], "rating"].mean() - base)
-            if g["asp_" + asp].sum() >= min_mencoes else np.nan
-            for asp in ASPECTOS
+            asp: (sp.loc[sp["aspecto"] == asp, "rating"].mean() - base)
+            if (sp["aspecto"] == asp).sum() >= min_mencoes else np.nan
+            for asp in aspectos
         }
-    return pd.DataFrame(linhas).T[list(ASPECTOS.keys())]
+    out = pd.DataFrame(linhas).T.reindex(columns=aspectos)
+    out.columns = [rotulo[a] for a in aspectos]
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -208,9 +261,12 @@ def texto_nuvem(df: pd.DataFrame, praia: str, stop: set) -> str:
 def carregar_dados(fonte) -> pd.DataFrame:
     """
     Lê o CSV (caminho ou buffer) e devolve o DataFrame já enriquecido:
-    tokens reconstruídos, UF/cidade de origem, data e flags de aspecto.
+    tokens reconstruídos, UF/cidade de origem, data e `review_id` (ligação com o ABSA).
     """
-    df = pd.read_csv(fonte, encoding="utf-8-sig")
+    df = pd.read_csv(fonte, encoding="utf-8-sig").reset_index(drop=True)
+
+    # id estável = ordem das linhas (chave de ligação com o ABSA granular)
+    df.insert(0, "review_id", range(1, len(df) + 1))
 
     # tokens (listas salvas como string)
     for c in [c for c in df.columns if c.endswith(COLS_TOKENS_SUFIXOS)]:
@@ -226,6 +282,9 @@ def carregar_dados(fonte) -> pd.DataFrame:
     df["ano"] = df["dt"].dt.year
     df["mes"] = df["dt"].dt.month
 
-    # aspectos (proxy)
-    df = adicionar_flags_aspecto(df)
+    # aspectos: agregados sob demanda a partir do ABSA (resumo_aspectos /
+    # matriz_frequencia / matriz_lift), ligados pela coluna `review_id`.
     return df
+
+
+# Fonte dos aspectos: ABSA Gemini (avaliacoes_aspectos_gemini.csv), ligado por review_id.

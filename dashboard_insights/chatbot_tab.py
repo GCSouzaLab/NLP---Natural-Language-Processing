@@ -213,8 +213,12 @@ def _executar_rag(pergunta: str, api_key: str) -> dict:
     return {"resposta": resposta, "praias": praias, "fontes": fontes}
 
 
-def render_chatbot() -> None:
-    """Renderiza a aba completa do chatbot. Chamar dentro de um st.tab ou diretamente."""
+def render_chatbot(altura: int = 600) -> None:
+    """Renderiza a aba completa do chatbot. Chamar dentro de um st.tab ou diretamente.
+
+    altura: altura (px) do box do histórico, que rola internamente. Padrão 600
+    (comportamento anterior); a página Assistente passa um valor menor.
+    """
 
     try:
         api_key: str = st.secrets.get("GEMINI_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
@@ -240,7 +244,7 @@ def render_chatbot() -> None:
             st.session_state.chat_messages = []
             st.rerun(scope="fragment")
 
-        with st.container(height=600, border=True):
+        with st.container(height=altura, border=True):
             if not st.session_state.chat_messages:
                 st.caption("👋 Olá! Pergunte algo como: *quero praia tranquila para família*")
             for msg in st.session_state.chat_messages:
